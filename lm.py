@@ -48,7 +48,7 @@ def estimate_loss(model, get_batch):
         total = 0.0
         for _ in range(cfg.eval_iters):
             xb, yb = get_batch(split)
-            _, loss = model(xb, yb)
+            _, loss, _ = model(xb, yb)
             total += loss.item()
         losses[split] = total / cfg.eval_iters
     model.train()
@@ -140,7 +140,12 @@ class CausalSelfAttention(nn.Module):
         mask = torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size)
         self.register_buffer("mask", mask)
 
-    def forward(self, x):
+    def forward(self, x, past_kv=None):
+        """
++        x: (B, T, C)
++        past_kv: None or tuple (k_past, v_past) each shape (B, nh, T_past, hs)
++        returns: y (B, T, C), present_kv (k_all, v_all)
++        """
         B, T, C = x.shape
 
         qkv = self.qkv(x) # (B, T, 3C)
@@ -151,18 +156,37 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # transpose(1,2)意思是交换第一维和第二维 (B, nh, T, hs)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # 所以每个qkv都是相同的形状 后续attn计算在每个head内做T*T的相关性矩阵
 
+        """
+        基础attn
         # scaled dot-product attention
         # q 是 (B, n_head, T, head_dim)
         # k^T 是 (B, n_head, head_dim, T)
         # att (B, n_head, T, T) 对每个batch 每个head 得到一个T*T的相似度矩阵：
         # att[..., t, s]表示 第t个token的query与第s个token的key的相似度（打分）
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim) # (B, nh, T, T)
+        """
+        # att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim) # (B, nh, T, T)
+        
         # 如果不除，head_dim 越大，点积的数值范围越大，softmax 会饱和（接近 0/1），梯度变小训练不稳定。
         # 缩放保证数值稳定，这是标准做法
 
         # 对于未来位置(s>t) 把分数置为-inf after softmax 这些位置的prob=0
         # 保证自回归： 第t个token只能看<=t的token
-        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
+        
+        # att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
+
+        """
+        加了KV cache版本
+        """
+        if past_kv is not None:
+            k_past, v_past = past_kv  # each (B, nh, T_past, hs)
+            # concatenate on time axis (dim=2)
+            k = torch.cat([k_past, k], dim=2)  # (B, nh, T_all, hs)
+            v = torch.cat([v_past, v], dim=2)
+        
+        att = ( q @ k.transpose(-2, -1) / math.sqrt(self.head_dim) )
+        # 拼接后的T_all长度有可能超过T, 用slice mask
+        T_all = k.shape[2]
+        att = att.masked_fill(self.mask[:, :, :T, :T_all] == 0, float("-inf"))
 
         # dim=-1最后一维，对每个t, 在s=0,...T-1上归一化：
         # 每一行（固定t) 变成概率分布， 表示当前token应该关注哪些历史token
@@ -178,7 +202,11 @@ class CausalSelfAttention(nn.Module):
         # self.proj = nn.Linear(C, C)
         # 多头拼接只把信息堆起来，proj负责把各个head的信息重新混合(learned mixing)
         y = self.drop(self.proj(y))
-        return y
+
+        # present_kv: 返回能被caller cache的full k,v 
+        # detach 以避免holding computation graph during generation
+        present_kv = (k.detach(), v.detach())
+        return y, present_kv
     
 # MLP 
 class MLP(nn.Module):
@@ -207,10 +235,18 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(n_embd)
         self.mlp = MLP(n_embd, dropout)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln1(x))
+    def forward(self, x, past=None):
+        # x = x + self.attn(self.ln1(x))
+        # x = x + self.mlp(self.ln2(x))
+
+        """
+        past: None or tuple (k_past, v_past) for this layer
+        returns: x_out, present_kv
+        """
+        attn_out, present = self.attn(self.ln1(x), past)
+        x = x + attn_out
         x = x + self.mlp(self.ln2(x))
-        return x
+        return x, present
 
 class MiniGPT(nn.Module):
     def __init__(self, vocab_size, block_size, n_embd, n_head, n_layer, dropout):
@@ -236,7 +272,7 @@ class MiniGPT(nn.Module):
 
     # idx: (B, T) token ids
     # targets: (B, T) next-token labels
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, pasts=None):
 
         B, T = idx.shape
         # pos embedding和Attn mask buffer都是和block size预建的，所以T不能超出
@@ -248,9 +284,17 @@ class MiniGPT(nn.Module):
         # broadcast广播 pos自动变粗(1, T, C) 再加到每个batch上 结果仍然是(B, T, C) 然后dropout正则化
         x = self.drop(tok + pos)
 
-        for blk in self.blocks:
-            x = blk(x)
+        # for blk in self.blocks:
+        #     x = blk(x)
         
+        # KV-cache版本：
+        presents = []
+        # 遍历blocks 并传入每层的past
+        for i, blk in enumerate(self.blocks):
+            layer_past = None if pasts is None else pasts[i]
+            x, present = blk(x, past=layer_past)
+            presents.append(present)
+
         x = self.ln_f(x)
         # logits位置t，对应的基于x[:t]的信息对下一个token的预测
         logits = self.lm_head(x) # (B, T, vocab)
@@ -264,7 +308,7 @@ class MiniGPT(nn.Module):
             # log softmox
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
-        return logits, loss 
+        return logits, loss, presents
         
     @torch.no_grad()    
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
@@ -285,14 +329,25 @@ class MiniGPT(nn.Module):
         循环 300 次，最终 (2, 305)。
         """
         self.eval() # dropout关闭（避免生成随机抖动更大，不符合训练预期） LN正常工作
+        B = idx.size(0)
+
+        # 初始化empty pasts(1层一个)
+        pasts = [None] * len(self.blocks)
+        
         for _ in range(max_new_tokens):
             # idx (B, T_current) 初始T_current=prompt长度
             # 每生成一步， T_current += 1
             # -self.block_size: 表示min(T_current, block_size)
             # 最终idx_cond (B,min) 上下文窗口
-            idx_cond = idx[:, -self.block_size:]
+            # idx_cond = idx[:, -self.block_size:]
+            idx_cond = idx[:, -1].to(next(self.parameters()).device)
             # logits 前向传播返回的， shape (B, T_cond, V)
-            logits, _ = self(idx_cond)
+            # logits, _ = self(idx_cond)
+            logits, _, presents = self(idx_cond, pasts=pasts)
+
+            # present是list of [k_all, v_all] per layer
+            pasts = presents
+
             # logits[:, -1, :] 代表：在当前位置（最后一个 token 之后）预测下一个 token 的 logits；形状变成：(B, V)
             # temperature < 1 更确定（分布更尖锐）； > 1 更发散（更随机）
             logits = logits[:, -1, :] / max(temperature, 1e-8)
@@ -337,7 +392,7 @@ def main():
         xb, yb = get_batch('train')
         # model()返回两个值： logits and loss
         # 训练阶段只需要loss
-        _, loss = model(xb, yb)
+        _, loss, _ = model(xb, yb)
 
         # pytorch grad是累加的，每一步反向传播前必须清零
         optimizer.zero_grad(set_to_none=True)
